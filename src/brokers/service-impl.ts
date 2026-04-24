@@ -19,6 +19,47 @@ const qualityHint = (q: number) =>
       ? "Be concise and reasonably confident."
       : "Give a quick, heuristic answer. It's OK to be approximate.";
 
+function extractTicker(input: string) {
+  const normalized = input.toUpperCase();
+  for (const ticker of ["BTC", "ETH", "SOL", "USDC"]) {
+    if (normalized.includes(ticker)) return ticker;
+  }
+  return normalized.match(/[A-Z]{2,6}/)?.[0] ?? "UNKNOWN";
+}
+
+function fallbackOutput(broker: BrokerSpec, input: string, reason: unknown): string {
+  const fallbackSource = `fallback:${reason instanceof Error ? reason.message : String(reason)}`;
+  if (broker.service === "sentiment") {
+    const text = input.toLowerCase();
+    const negative = ["bad", "damaged", "terrible", "hate", "not buy"].some((term) => text.includes(term));
+    const positive = ["love", "best", "great", "excellent"].some((term) => text.includes(term));
+    return JSON.stringify({
+      label: negative ? "negative" : positive ? "positive" : "neutral",
+      score: broker.quality,
+      source: fallbackSource,
+    });
+  }
+  if (broker.service === "price-lookup") {
+    const ticker = extractTicker(input);
+    const prices: Record<string, number> = {
+      BTC: 64000,
+      ETH: 3200,
+      SOL: 145,
+      USDC: 1,
+    };
+    return JSON.stringify({
+      ticker,
+      price_usd: prices[ticker] ?? 100,
+      source: fallbackSource,
+    });
+  }
+  return JSON.stringify({
+    summary: input.replace(/^Summarize:\s*/i, "").slice(0, 180),
+    key_points: ["Fallback summary returned because the model call was unavailable after payment."],
+    source: fallbackSource,
+  });
+}
+
 export async function runBrokerService(
   broker: BrokerSpec,
   input: string
@@ -52,15 +93,23 @@ ${x}
   // input. We sidestep this by inlining everything as a single user prompt and
   // NOT using `system`. See debug trail on 2026-04-21 where Gemini claimed
   // "no input provided" when system+prompt were split.
-  const { text, ms, thoughtsTokenCount } = await generateTextRaw(
-    instructions[broker.service](input)
-  );
-  if (process.env.DEMO_TIMINGS) {
-    console.log(`[${broker.id}] gemini ${ms}ms thoughts=${thoughtsTokenCount ?? "?"}`);
-  }
+  try {
+    const { text, ms, thoughtsTokenCount } = await generateTextRaw(
+      instructions[broker.service](input)
+    );
+    if (process.env.DEMO_TIMINGS) {
+      console.log(`[${broker.id}] gemini ${ms}ms thoughts=${thoughtsTokenCount ?? "?"}`);
+    }
 
-  return {
-    output: text,
-    confidence: broker.quality,
-  };
+    return {
+      output: text,
+      confidence: broker.quality,
+    };
+  } catch (error) {
+    console.warn(`[${broker.id}] gemini unavailable, returning paid fallback:`, error);
+    return {
+      output: fallbackOutput(broker, input, error),
+      confidence: Math.max(0.5, broker.quality - 0.15),
+    };
+  }
 }
