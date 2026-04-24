@@ -1,0 +1,17 @@
+.env
+.env.local
+node_modules/
+.next/
+dist/
+*.log
+.DS_Store
+.claude/
+.cache/
+.venv/
+demo-output/
+output/
+scripts/__pycache__/
+*.pyc
+agenticeconomyhackathon@1.0.0
+tsx
+tmp/

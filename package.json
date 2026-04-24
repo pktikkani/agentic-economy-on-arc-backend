@@ -1,0 +1,36 @@
+{
+  "name": "agentic-economy-on-arc-backend",
+  "version": "1.0.0",
+  "private": false,
+  "description": "Railway backend for the Arc Agent-to-Agent Marketplace hackathon demo.",
+  "type": "module",
+  "scripts": {
+    "backend:dev": "python -m uvicorn backend.app:app --reload --host 127.0.0.1 --port 8000",
+    "brokers": "tsx src/brokers/seller-server.ts",
+    "check:balances": "tsx scripts/check-balances.ts",
+    "register:brokers": "tsx scripts/register-brokers.ts"
+  },
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^3.0.64",
+    "@circle-fin/developer-controlled-wallets": "^10.3.0",
+    "@circle-fin/x402-batching": "^2.1.0",
+    "@google/genai": "^1.50.1",
+    "@x402/core": "^2.10.0",
+    "@x402/evm": "^2.10.0",
+    "ai": "^6.0.168",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "tsx": "^4.21.0",
+    "viem": "^2.48.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3"
+  }
+}
