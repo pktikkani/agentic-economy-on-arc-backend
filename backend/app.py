@@ -27,6 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPLORER = os.environ.get("ARC_EXPLORER", "https://testnet.arcscan.app")
 CHAIN_ID = int(os.environ.get("ARC_CHAIN_ID", "5042002"))
 BROKER_IDS = ["A", "B", "C", "D", "E"]
+SELLER_BROKER_PORTS = [3001, 3002, 3003, 3004, 3005]
+seller_server_proc: subprocess.Popen[str] | None = None
 
 
 class TaskProfile(BaseModel):
@@ -104,8 +106,17 @@ def free_port() -> int:
 
 
 def run_json(*args: str) -> dict[str, Any]:
-    result = subprocess.run(list(args), cwd=REPO_ROOT, capture_output=True, text=True, check=True)
-    return json.loads(result.stdout)
+    try:
+        result = subprocess.run(list(args), cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as error:
+        detail = "\n".join(part for part in [error.stderr.strip(), error.stdout.strip()] if part)
+        command = " ".join(args)
+        raise RuntimeError(detail or f"{command} exited with status {error.returncode}") from error
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        command = " ".join(args)
+        raise RuntimeError(f"{command} returned non-JSON output: {result.stdout[:500]}") from error
 
 
 def write_receipt(filename: str, payload: dict[str, Any]) -> str:
@@ -147,6 +158,58 @@ async def wait_for_a2a(
                 continue
             await asyncio.sleep(0.2)
     raise TimeoutError(f"A2A server did not become ready: {base_url}")
+
+
+async def brokers_ready() -> bool:
+    async with httpx.AsyncClient(timeout=1.0) as client:
+        for port in SELLER_BROKER_PORTS:
+            try:
+                response = await client.get(f"http://127.0.0.1:{port}/health")
+            except httpx.HTTPError:
+                return False
+            if response.status_code != 200:
+                return False
+    return True
+
+
+async def wait_for_seller_server(proc: subprocess.Popen[str], timeout_s: float = 30.0) -> None:
+    started = time.time()
+    while time.time() - started < timeout_s:
+        if await brokers_ready():
+            return
+        if proc.poll() is not None:
+            detail = process_error(proc)
+            raise RuntimeError(
+                "Broker seller server exited before becoming ready"
+                + (f": {detail}" if detail else "")
+            )
+        await asyncio.sleep(0.3)
+    raise TimeoutError("Broker seller server did not expose ports 3001-3005 in time")
+
+
+async def ensure_seller_server() -> None:
+    global seller_server_proc
+    if await brokers_ready():
+        return
+
+    env = load_env()
+    if seller_server_proc is None or seller_server_proc.poll() is not None:
+        seller_server_proc = subprocess.Popen(
+            ["npx", "tsx", "src/brokers/seller-server.ts"],
+            cwd=REPO_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+    await wait_for_seller_server(seller_server_proc)
+
+
+def stop_seller_server() -> None:
+    global seller_server_proc
+    if seller_server_proc is not None and seller_server_proc.poll() is None:
+        stop_processes([seller_server_proc])
+    seller_server_proc = None
 
 
 async def wait_for_sidecars(port_map: dict[str, int], procs: list[subprocess.Popen[str]]) -> None:
@@ -528,6 +591,21 @@ async def stream_events(events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"ok": "true"}
+
+
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"service": "Arc A2A Backend", "health": "/health"}
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    await ensure_seller_server()
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    stop_seller_server()
 
 
 @app.get("/demo/run")

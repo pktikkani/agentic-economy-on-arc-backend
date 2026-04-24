@@ -14,6 +14,7 @@ Mention both repositories in the hackathon submission README/repository field.
 ## What This Service Does
 
 - Starts broker assessment sidecars using A2A protocol wrappers.
+- Starts the local x402 seller broker APIs inside the backend container.
 - Uses PydanticAI + Gemini 3 Flash for task profiling, broker selection, and judging.
 - Calls Circle Developer-Controlled Wallet APIs for x402 payment signing and Arc contract execution.
 - Writes ERC-8004 quality feedback to Arc testnet after each paid broker response.
@@ -27,9 +28,10 @@ flowchart LR
   API --> Profile["PydanticAI Task Profiler"]
   API --> Sidecars["A2A Broker Sidecars"]
   API --> Judge["PydanticAI Judge"]
+  API --> Sellers["Local x402 Seller Broker APIs"]
   API --> Helpers["TypeScript Circle/x402 Helpers"]
   Helpers --> Circle["Circle Developer-Controlled Wallet"]
-  Helpers --> Brokers["x402 Broker APIs"]
+  Helpers --> Sellers
   Circle --> Arc["Arc Testnet / ERC-8004 Reputation"]
   API -->|Arc tx links + receipts| Web
 ```
@@ -42,9 +44,10 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -r backend/requirements.txt
 
-npm run brokers
 python -m uvicorn backend.app:app --reload --host 127.0.0.1 --port 8000
 ```
+
+The FastAPI process starts the broker seller APIs on ports `3001-3005` automatically, which is the same setup the Railway container uses.
 
 Health check:
 
