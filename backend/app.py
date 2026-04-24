@@ -423,7 +423,15 @@ async def demo_events(tasks_count: int) -> AsyncIterator[dict[str, Any]]:
                     f"Service type: {chosen['service']}\nTask: {task}\nBroker output: {paid_data['result']['output']}"
                 )
             ).output
-            yield {"type": "judge_score", "brokerId": chosen["id"], "quality": judge.quality, "reason": judge.reason}
+            yield {
+                "type": "judge_score",
+                "index": index,
+                "total": len(tasks),
+                "brokerId": chosen["id"],
+                "brokerName": chosen["name"],
+                "quality": judge.quality,
+                "reason": judge.reason,
+            }
 
             feedback = run_json("npx", "tsx", "scripts/give-feedback-json.ts", chosen["id"], str(judge.quality))
             yield {
@@ -443,10 +451,14 @@ async def demo_events(tasks_count: int) -> AsyncIterator[dict[str, Any]]:
                 "type": "task_completed",
                 "index": index,
                 "total": len(tasks),
+                "task": task,
                 "brokerId": chosen["id"],
+                "brokerName": chosen["name"],
                 "priceUsd": price_usd,
                 "judgeScore": judge.quality,
+                "judgeReason": judge.reason,
                 "latencyMs": latency_ms,
+                "txHash": feedback["txHash"],
             }
 
         yield {
