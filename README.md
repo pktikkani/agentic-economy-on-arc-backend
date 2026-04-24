@@ -19,6 +19,7 @@ Mention both repositories in the hackathon submission README/repository field.
 - Calls Circle Developer-Controlled Wallet APIs for x402 payment signing and Arc contract execution.
 - Writes ERC-8004 quality feedback to Arc testnet after each paid broker response.
 - Streams `/demo/run` and `/fifty/run` Server-Sent Events to the web UI.
+- Runs the 50-transaction proof with bounded parallelism. Default is `3` workers and the service caps it at `5` to stay inside Circle wallet API and EVM transaction queue limits.
 
 ## Architecture
 
@@ -96,6 +97,9 @@ The current code has these public Arc testnet broker IDs as defaults, so the ove
 - `GET /health`
 - `GET /demo/run?tasks=1`
 - `GET /fifty/run?total=50`
+- `GET /fifty/run?total=50&concurrency=5`
+
+`concurrency` is optional. Keep it between `3` and `5` for the public demo. Do not use `25` with a single Circle wallet unless the payment and reputation writes are sharded across multiple wallets.
 
 ## Security
 

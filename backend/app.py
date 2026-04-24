@@ -29,6 +29,8 @@ CHAIN_ID = int(os.environ.get("ARC_CHAIN_ID", "5042002"))
 BROKER_IDS = ["A", "B", "C", "D", "E"]
 SELLER_BROKER_PORTS = [3001, 3002, 3003, 3004, 3005]
 seller_server_proc: subprocess.Popen[str] | None = None
+DEFAULT_FIFTY_CONCURRENCY = 3
+MAX_FIFTY_CONCURRENCY = 5
 
 
 class TaskProfile(BaseModel):
@@ -103,6 +105,16 @@ def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def bounded_fifty_concurrency(total: int, requested: int | None = None) -> int:
+    configured = requested
+    if configured is None:
+        try:
+            configured = int(os.environ.get("FIFTY_CONCURRENCY", str(DEFAULT_FIFTY_CONCURRENCY)))
+        except ValueError:
+            configured = DEFAULT_FIFTY_CONCURRENCY
+    return max(1, min(MAX_FIFTY_CONCURRENCY, configured, total))
 
 
 def run_json(*args: str) -> dict[str, Any]:
@@ -449,38 +461,51 @@ async def demo_events(tasks_count: int) -> AsyncIterator[dict[str, Any]]:
         stop_processes(procs)
 
 
-async def fifty_events(total: int) -> AsyncIterator[dict[str, Any]]:
+async def fifty_events(total: int, requested_concurrency: int | None = None) -> AsyncIterator[dict[str, Any]]:
     load_env()
     count = max(1, total)
+    concurrency = bounded_fifty_concurrency(count, requested_concurrency)
     run_id = f"web-a2a-fifty-{int(time.time() * 1000)}"
-    port = free_port()
+    ports = [free_port() for _ in range(concurrency)]
     env = load_env()
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "backend.fast_pay_sidecar", "--broker-id", "A", "--port", str(port)],
-        cwd=REPO_ROOT,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-m", "backend.fast_pay_sidecar", "--broker-id", "A", "--port", str(port)],
+            cwd=REPO_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        for port in ports
+    ]
     try:
-        base_url = f"http://127.0.0.1:{port}"
-        await wait_for_a2a(base_url, proc)
+        base_urls = [f"http://127.0.0.1:{port}" for port in ports]
+        await asyncio.gather(
+            *[wait_for_a2a(base_url, proc) for base_url, proc in zip(base_urls, procs, strict=True)]
+        )
         buyer = env.get("CIRCLE_WALLET_ADDRESS", "unknown")
+        seller_url = f"{concurrency} A2A fast-pay workers -> broker A /service-fast"
         yield {
             "type": "fifty_started",
             "runId": run_id,
             "total": count,
-            "sellerUrl": f"{base_url} -> broker A /service-fast",
+            "concurrency": concurrency,
+            "sellerUrl": seller_url,
             "buyer": buyer,
             "buyerUrl": f"{EXPLORER}/address/{buyer}",
         }
 
-        client = A2AClient(base_url)
+        clients = [A2AClient(base_url) for base_url in base_urls]
         results: list[dict[str, Any]] = []
         started = time.time()
         try:
+            index_queue: asyncio.Queue[int] = asyncio.Queue()
+            result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
             for index in range(1, count + 1):
+                index_queue.put_nowait(index)
+
+            async def run_one(index: int, client: A2AClient) -> None:
                 tx_started = time.time()
                 try:
                     response = await client.send_message(
@@ -495,20 +520,26 @@ async def fifty_events(total: int) -> AsyncIterator[dict[str, Any]]:
                     result = result_task["result"]["artifacts"][0]["parts"][0]["data"]["result"]
                     proof_tx_hash = ""
                     if result["ok"]:
-                        proof = run_json("npx", "tsx", "scripts/give-feedback-json.ts", "A", "1")
+                        proof = await asyncio.to_thread(
+                            run_json, "npx", "tsx", "scripts/give-feedback-json.ts", "A", "1"
+                        )
                         proof_tx_hash = proof["txHash"]
                     dur_ms = round((time.time() - tx_started) * 1000)
                     record = {"index": index, **result, "dur_ms": dur_ms, "proof_tx_hash": proof_tx_hash}
-                    results.append(record)
-                    yield {
-                        "type": "tx_progress",
-                        "index": index,
-                        "total": count,
-                        "status": result["status"],
-                        "durMs": dur_ms,
-                        "ok": result["ok"] and bool(proof_tx_hash),
-                        "proofTxHash": proof_tx_hash,
-                    }
+                    await result_queue.put(
+                        {
+                            "record": record,
+                            "event": {
+                                "type": "tx_progress",
+                                "txIndex": index,
+                                "total": count,
+                                "status": result["status"],
+                                "durMs": dur_ms,
+                                "ok": result["ok"] and bool(proof_tx_hash),
+                                "proofTxHash": proof_tx_hash,
+                            },
+                        }
+                    )
                 except Exception as error:
                     dur_ms = round((time.time() - tx_started) * 1000)
                     record = {
@@ -519,19 +550,51 @@ async def fifty_events(total: int) -> AsyncIterator[dict[str, Any]]:
                         "proof_tx_hash": "",
                         "note": str(error),
                     }
-                    results.append(record)
-                    yield {
-                        "type": "tx_progress",
-                        "index": index,
-                        "total": count,
-                        "status": 0,
-                        "durMs": dur_ms,
-                        "ok": False,
-                        "note": str(error),
-                    }
-        finally:
-            await client.http_client.aclose()
+                    await result_queue.put(
+                        {
+                            "record": record,
+                            "event": {
+                                "type": "tx_progress",
+                                "txIndex": index,
+                                "total": count,
+                                "status": 0,
+                                "durMs": dur_ms,
+                                "ok": False,
+                                "note": str(error),
+                            },
+                        }
+                    )
 
+            async def worker(worker_id: int) -> None:
+                client = clients[worker_id]
+                while True:
+                    try:
+                        index = index_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        await run_one(index, client)
+                    finally:
+                        index_queue.task_done()
+
+            workers = [asyncio.create_task(worker(worker_id)) for worker_id in range(concurrency)]
+            try:
+                for completed in range(1, count + 1):
+                    item = await result_queue.get()
+                    results.append(item["record"])
+                    event = item["event"]
+                    event["index"] = completed
+                    yield event
+                await index_queue.join()
+            finally:
+                for worker_task in workers:
+                    if not worker_task.done():
+                        worker_task.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+        finally:
+            await asyncio.gather(*[client.http_client.aclose() for client in clients], return_exceptions=True)
+
+        results.sort(key=lambda result: result["index"])
         ok_count = sum(1 for result in results if result["ok"])
         avg = round(sum(result["dur_ms"] for result in results if result["ok"]) / max(1, ok_count))
         total_spent = ok_count * 0.003
@@ -545,6 +608,7 @@ async def fifty_events(total: int) -> AsyncIterator[dict[str, Any]]:
                     "runId": run_id,
                     "requirement": "50+ sub-cent on-chain payment proof",
                     "proofNote": "Arcscan address page is a general buyer activity page; use this receipt timestamp and tx count to identify this run.",
+                    "concurrency": concurrency,
                     "okCount": ok_count,
                     "total": count,
                     "totalWallMs": total_wall_ms,
@@ -555,7 +619,7 @@ async def fifty_events(total: int) -> AsyncIterator[dict[str, Any]]:
                     "proofTxUrls": [f"{EXPLORER}/tx/{tx_hash}" for tx_hash in proof_tx_hashes],
                     "buyer": buyer,
                     "buyerUrl": buyer_url,
-                    "sellerUrl": f"{base_url} -> broker A /service-fast",
+                    "sellerUrl": seller_url,
                     "createdAt": datetime.now(UTC).isoformat(),
                 },
                 "results": results,
@@ -564,6 +628,7 @@ async def fifty_events(total: int) -> AsyncIterator[dict[str, Any]]:
         yield {
             "type": "fifty_summary",
             "runId": run_id,
+            "concurrency": concurrency,
             "okCount": ok_count,
             "total": count,
             "totalWallMs": total_wall_ms,
@@ -576,7 +641,7 @@ async def fifty_events(total: int) -> AsyncIterator[dict[str, Any]]:
             "receipt": receipt,
         }
     finally:
-        stop_processes([proc])
+        stop_processes(procs)
 
 
 async def stream_events(events: AsyncIterator[dict[str, Any]]) -> AsyncIterator[str]:
@@ -614,5 +679,9 @@ def run_demo(tasks: int = Query(default=1, ge=1)) -> StreamingResponse:
 
 
 @app.get("/fifty/run")
-def run_fifty(total: int = Query(default=50, ge=1)) -> StreamingResponse:
-    return StreamingResponse(stream_events(fifty_events(total)), media_type="text/event-stream")
+def run_fifty(
+    total: int = Query(default=50, ge=1),
+    concurrency: int = Query(default=0, ge=0, le=MAX_FIFTY_CONCURRENCY),
+) -> StreamingResponse:
+    requested = concurrency if concurrency > 0 else None
+    return StreamingResponse(stream_events(fifty_events(total, requested)), media_type="text/event-stream")
